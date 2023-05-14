@@ -153,3 +153,187 @@
   - Redis 6부터는 ACL 설정을 제공
 - 해당 이슈로 전체 시스템의 보안 윟벼이 높아지는 경우가 많음
 
+---
+
+## Redis 상용 이슈들
+
+### Thundering Herd
+
+- 특정 이벤트로 인해서 많은 프로세스가 동작하는 데, 그 중에 하나의 프로세스만 이벤트를 처리할 수 있어서,
+
+    많은 프로세스가 특정 리소스를 가지고 경쟁하면서 많은 리소스를 낭비하게 되는 경우
+- 웹 서비스에서는 Cache Miss로 인해서, 많은 프로세스가 같은 Key를 DB에서 읽으려고 시도하면서, 특정 서버에
+
+    부하를 극도로 증가시키는 경우를 의미한다
+
+![image](https://github.com/TTTAttributedLabel/TTTAttributedLabel/assets/40031858/b7a0aebb-2523-45bb-a2e3-dca905112ac4)
+
+### Thundering Herd의 원인
+
+- 캐시가 없을 때 발생함
+  - 캐시가 없는 현상의 이유
+    - 캐시 서버의 추가/삭제
+    - 해당 키의 TTL에 의한 데이터 삭제
+    - 캐시 서버 메모리 부족으로 해당 키의 Eviction
+
+### Cache Stampede
+
+- Cache의 Expire Time 설정으로 인해서 대규모의 중복된 DB쿼리와 중복된 Cache 쓰기가 발생하는 현상(Thundering Herd)
+
+### Probabilistic Early Recomputation
+
+- Cache Stampede를 해결하기 위한 방법 중의 하나
+- 키의 TTL이 완료하기 전에 Random 한 가상의 Expire Time을 설정해서 미리 키의 내용을 갱신하는 방법
+![image](https://github.com/TTTAttributedLabel/TTTAttributedLabel/assets/40031858/3e68fc45-b45f-48ef-9930-61486e12bd7d)
+- DELTA, BETA 값을 지정하게 된다
+- DELTA는 실제로 캐시 재계산을 위한 시간 범위
+  - 예) 대략 500ms 근처에서 재계산이 일어나면 좋겠다
+- BETA는 여기에 다시 가중치를 준다
+  - 기본으로는 1.0을 사용
+  - BETA < 1.0 은 좀 더 소극적으로 재계싼을 하게 된다
+  - BETA > 1.0 은 좀 더 적극적으로 재계산을 하게 된다
+- Expiry는 캐시가 Expire될 시간을 말한다
+  - Expiry = now() + 남은 ttl 시간
+- 즉 계산식은 다음과 같다
+  - Now() + abs(DELTA * BETA * log(random())) > expiry
+  - Now() + abs(DELTA * BETA * log(random*())) > Now() + ttl_ms
+  - ttl_ms - abs(DELTA* BETA * log(random())) > 0
+
+
+## 예시
+
+```java
+@Service
+public class RedisService {
+
+    private RedissonClient redissonClient;
+
+    @Value("${redis.host}")
+    private String redisHost;
+
+    @Value("${redis.port}")
+    private int redisPort;
+
+    @PostConstruct
+    public void init() {
+        Config config = new Config();
+        config.useSingleServer().setAddress("redis://" + redisHost + ":" + redisPort);
+        redissonClient = Redisson.create(config);
+    }
+
+    public String getValue(String key) {
+        RBucket<String> bucket = redissonClient.getBucket(key);
+        String value = bucket.get();
+        if (value == null) {
+            if (shouldRecompute(key)) {
+                value = doExpensiveComputation();
+                bucket.set(value, Duration.ofMinutes(5));
+            } else {
+                waitRandomTime();
+                return getValue(key);
+            }
+        }
+        return value;
+    }
+
+    private boolean shouldRecompute(String key) {
+        double probability = hash(key) % 0.1;
+        double threshold = 0.05;
+        return probability < threshold;
+    }
+
+    private void waitRandomTime() {
+        try {
+            Thread.sleep(new Random().nextInt(10) + 1);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
+    }
+
+    private String doExpensiveComputation() {
+        try {
+            Thread.sleep(1000);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
+        return "value";
+    }
+
+    private int hash(String key) {
+        return key.hashCode();
+    }
+}
+```
+
+---
+
+### Hot Key
+
+- 과도하게 읽기/쓰기 요청이 집중되게 되는 key
+- 해당 Key의 접근으로 인해서 Storage( DB, Cache) 성능 저하가 발생하는 Key를 Hot Key라고 부른다
+
+![image](https://github.com/TTTAttributedLabel/TTTAttributedLabel/assets/40031858/bb023931-86b7-4c60-8038-ca02849837f1)
+
+### Hot Key에 대한 일반적인 해결책
+- Query Off(Read From Secondary)
+- Local Cache
+- Multiple Write And Read From One
+
+### Query Off
+- Redis의 경우 Replication 기능을 제공해 준다
+- Write는 Primary, Read는 Secondary를 이용하여, Read 부하를 줄일 수 있다
+- AWS ElasticCache Redis의 경우 최대 5개의 읽기 전용 복제본을 추가할 수 있다
+
+#### 읽기 분배 - QUERY OFF
+
+![image](https://github.com/TTTAttributedLabel/TTTAttributedLabel/assets/40031858/cc201b30-d5c6-42d3-8ff2-9f9e72fb683b)
+
+### API 서버에서의 Local Cache
+
+API 서버에서 직접 특정 Key들을 Cache해서 Cache 서버에 가지 않고 API 서버에서 바로 처리한다 (API 서버 수만큼 처리량이 나눠짐)
+
+![image](https://github.com/TTTAttributedLabel/TTTAttributedLabel/assets/40031858/1f7652be-db62-4ff3-ac60-f0dc26aea89e)
+
+#### Local Cache 단점
+- Cache가 공유되지 않고 API 서버에만 존재
+- 데이터가 변경되었을 때, 이를 통지 받는 메커니즘이 필요
+  - 변경 통지가 없다면, TTL이 끝날 때까지 데이터의 불일치가 발생
+- 이런 문제의 해결점으로 Client-Side Cache을 제공하는 Cache 솔루션이 있다
+
+### Multi Write Read One
+- Cache를 써야 할때 하나의 Key를 남기는 것이 아니라, 여러 개의 키로 남기고 읽을 때는 하나의 Key만 읽어서 부하를 분산
+- APi 서버에서 여러 Cache 서버에 Write를 한다
+- Write(A) => Write(A1), Write(A2), Write(A3)
+- Read(A)  => Read(A1) or Read(A2) or Read(A3)
+
+![image](https://github.com/TTTAttributedLabel/TTTAttributedLabel/assets/40031858/30b355d1-9c73-4357-9113-0d2fdccec073)
+
+![image](https://github.com/TTTAttributedLabel/TTTAttributedLabel/assets/40031858/006da94d-c252-4c83-b67c-2030cef7ea88)
+
+#### Multi Write Read One의 단점
+- 좀더 많은 Cache 장비를 사용하여야 한다 ㅠ
+
+
+### Timeout
+
+![image](https://github.com/TTTAttributedLabel/TTTAttributedLabel/assets/40031858/1f0630d1-72a5-4df8-be76-8aaf95b56b0d)
+
+위와 같은 경우 정상적인 경우 Add가 문제 없다
+
+다만 Callee가 먼저 TimeOut이 발생하는 경우
+- Callee가 먼저 Timeout이 발생하면 Caller에서 에러가 리턴된다
+
+
+![image](https://github.com/TTTAttributedLabel/TTTAttributedLabel/assets/40031858/2270e412-46e9-4063-a522-a22e32cd87c7)
+
+Caller가 먼저 Timeout이 발생하는 경우
+- Caller가 먼저 Timeout이 발생하면 Callee는 계속 실행이 된다
+- Callee가 딱 Processing Timeout직전에 수행이 완료되면, 실제 데이터는 이미 들어가 있는 상태가 된다
+- Retry를 한다면 데이터 중복이 발생하게 된다
+![image](https://github.com/TTTAttributedLabel/TTTAttributedLabel/assets/40031858/6a6d9772-72b5-4404-93bb-69adb4942f4a)
+
+### TimeOut설정 결론
+
+- 항상 caller의 Timeout 설정이 Callee보다 커야한다
+
+![image](https://github.com/TTTAttributedLabel/TTTAttributedLabel/assets/40031858/e7e17416-ddbb-4025-8dcb-2b7e60e19014)
