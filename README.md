@@ -337,3 +337,11 @@ Caller가 먼저 Timeout이 발생하는 경우
 - 항상 caller의 Timeout 설정이 Callee보다 커야한다
 
 ![image](https://github.com/TTTAttributedLabel/TTTAttributedLabel/assets/40031858/e7e17416-ddbb-4025-8dcb-2b7e60e19014)
+
+# 중요
+
+## Redis Thundering Herd 문제를 해결하기 위한 글 링크
+
+https://bakjuna.tistory.com/93
+
+https://engineering.linecorp.com/ko/blog/atomic-cache-stampede-redis-lua-script 
